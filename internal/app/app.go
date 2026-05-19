@@ -992,7 +992,8 @@ func (a App) renderStatusBar() string {
 	// Center: status message or state hint
 	center := ""
 	switch a.state {
-	case StateNewCollection, StateNewRequest, StateRename:
+	case StateNewCollection, StateNewRequest, StateRename,
+		StateNewHeaderKey, StateNewHeaderValue, StateEditHeaderValue:
 		center = lipgloss.NewStyle().Foreground(ui.ColorBorderFocused).Render("  "+a.overlayTitle+": ") +
 			a.overlayInput.View() +
 			ui.MutedStyle.Render("  <Enter> confirm  <Esc> cancel")
