@@ -17,6 +17,8 @@ const (
 	EditorTabAuth
 )
 
+var editorTabs = []EditorTab{EditorTabHeaders, EditorTabBody, EditorTabAuth}
+
 func (t EditorTab) String() string {
 	switch t {
 	case EditorTabHeaders:
@@ -30,13 +32,14 @@ func (t EditorTab) String() string {
 	}
 }
 
+var methods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+
 type EditorPanel struct {
 	Request    *storage.Request
 	ActiveTab  EditorTab
 	URLInput   textinput.Model
-	BodyInput  textinput.Model
-	Focused    bool
 	InsertMode bool
+	Focused    bool
 	Width      int
 	Height     int
 }
@@ -46,116 +49,129 @@ func NewEditorPanel() EditorPanel {
 	url.Placeholder = "https://api.example.com/endpoint"
 	url.CharLimit = 512
 
-	body := textinput.New()
-	body.Placeholder = `{"key": "value"}`
-	body.CharLimit = 4096
-
-	return EditorPanel{
-		URLInput:  url,
-		BodyInput: body,
-	}
+	return EditorPanel{URLInput: url}
 }
 
 func (p *EditorPanel) SetRequest(r *storage.Request) {
 	p.Request = r
 	if r != nil {
 		p.URLInput.SetValue(r.URL)
-		p.BodyInput.SetValue(r.Body)
 	} else {
 		p.URLInput.SetValue("")
-		p.BodyInput.SetValue("")
 	}
 }
 
 func (p *EditorPanel) NextTab() {
-	p.ActiveTab = EditorTab((int(p.ActiveTab) + 1) % 3)
+	p.ActiveTab = EditorTab((int(p.ActiveTab) + 1) % len(editorTabs))
+}
+
+func (p *EditorPanel) PrevTab() {
+	p.ActiveTab = EditorTab((int(p.ActiveTab) - 1 + len(editorTabs)) % len(editorTabs))
+}
+
+func (p *EditorPanel) CycleMethod() {
+	if p.Request == nil {
+		return
+	}
+	for i, m := range methods {
+		if m == p.Request.Method {
+			p.Request.Method = methods[(i+1)%len(methods)]
+			return
+		}
+	}
+	p.Request.Method = methods[0]
 }
 
 func (p EditorPanel) View() string {
-	panelStyle := PanelStyle
-	titleStyle := TitleStyle
+	style := PanelStyle
+	titleSt := TitleStyle
 	if p.Focused {
-		panelStyle = PanelFocusedStyle
-		titleStyle = TitleFocusedStyle
+		style = PanelFocusedStyle
+		titleSt = TitleFocusedStyle
 	}
 
-	title := titleStyle.Render("Request Editor")
-
+	title := titleSt.Render("Request Editor")
 	var sb strings.Builder
 	sb.WriteString(title + "\n")
 
 	if p.Request == nil {
-		sb.WriteString(MutedStyle.Padding(1, 1).Render("Select a request to edit"))
-		return panelStyle.
-			Width(p.Width - 2).
-			Height(p.Height - 2).
-			Render(sb.String())
+		sb.WriteString(MutedStyle.Padding(1, 1).Render("Select a request"))
+		return style.Width(p.Width - 2).Height(p.Height - 2).Render(sb.String())
 	}
 
-	// Method + URL row
-	method := MethodStyle(p.Request.Method).
+	// Method + URL
+	methodBox := MethodStyle(p.Request.Method).
 		Border(lipgloss.NormalBorder()).
 		BorderForeground(ColorBorder).
 		Padding(0, 1).
 		Render(p.Request.Method)
 
-	urlWidth := p.Width - lipgloss.Width(method) - 8
-	p.URLInput.Width = urlWidth
+	methodW := lipgloss.Width(methodBox)
+	urlAvail := p.Width - methodW - 10
+	if urlAvail < 10 {
+		urlAvail = 10
+	}
+	p.URLInput.Width = urlAvail
 
+	urlBorderColor := ColorBorder
+	if p.InsertMode {
+		urlBorderColor = ColorBorderFocused
+	}
 	urlBox := lipgloss.NewStyle().
 		Border(lipgloss.NormalBorder()).
-		BorderForeground(ColorBorder).
+		BorderForeground(urlBorderColor).
 		Padding(0, 1).
-		Width(urlWidth).
+		Width(urlAvail).
 		Render(p.URLInput.View())
 
-	sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, method, " ", urlBox) + "\n\n")
+	sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, methodBox, " ", urlBox) + "\n\n")
 
-	// Tabs
-	tabs := []EditorTab{EditorTabHeaders, EditorTabBody, EditorTabAuth}
+	// Tab bar
 	tabBar := ""
-	for _, t := range tabs {
+	for _, t := range editorTabs {
 		label := fmt.Sprintf(" %s ", t.String())
 		if t == p.ActiveTab {
-			tabBar += lipgloss.NewStyle().
-				Foreground(ColorTitleFocused).
-				Bold(true).
-				Underline(true).
-				Render(label)
+			tabBar += lipgloss.NewStyle().Foreground(ColorTitleFocused).Bold(true).Underline(true).Render(label)
 		} else {
 			tabBar += MutedStyle.Render(label)
 		}
 		tabBar += " "
 	}
 	sb.WriteString(tabBar + "\n")
-	sb.WriteString(lipgloss.NewStyle().Foreground(ColorBorder).Render(strings.Repeat("─", p.Width-6)) + "\n")
+	sb.WriteString(MutedStyle.Render(strings.Repeat("─", p.Width-6)) + "\n")
 
 	// Tab content
+	contentW := p.Width - 8
 	switch p.ActiveTab {
 	case EditorTabHeaders:
-		if p.Request.Headers == nil || len(p.Request.Headers) == 0 {
-			sb.WriteString(MutedStyle.Padding(0, 1).Render("No headers. Press n to add.") + "\n")
+		if len(p.Request.Headers) == 0 {
+			sb.WriteString(MutedStyle.Padding(0, 1).Render("No headers  ·  press n to add") + "\n")
 		} else {
 			for k, v := range p.Request.Headers {
 				key := lipgloss.NewStyle().Foreground(ColorMethodGET).Render(k)
-				val := NormalItemStyle.Render(v)
-				sb.WriteString(fmt.Sprintf("  %s: %s\n", key, val))
+				sb.WriteString(fmt.Sprintf("  %s: %s\n", key, v))
 			}
 		}
 	case EditorTabBody:
-		p.BodyInput.Width = p.Width - 8
-		sb.WriteString(lipgloss.NewStyle().
-			Border(lipgloss.NormalBorder()).
-			BorderForeground(ColorBorder).
-			Padding(0, 1).
-			Width(p.Width - 8).
-			Render(p.BodyInput.View()) + "\n")
+		if p.Request.Body == "" {
+			sb.WriteString(MutedStyle.Padding(0, 1).Render("Empty body  ·  press e to edit in $EDITOR") + "\n")
+		} else {
+			preview := p.Request.Body
+			if len(preview) > 300 {
+				preview = preview[:300] + "..."
+			}
+			sb.WriteString(lipgloss.NewStyle().
+				Border(lipgloss.NormalBorder()).
+				BorderForeground(ColorBorder).
+				Padding(0, 1).
+				Width(contentW).
+				Render(preview) + "\n")
+		}
+		hint := MutedStyle.Render("  e · edit in $EDITOR")
+		sb.WriteString(hint + "\n")
 	case EditorTabAuth:
-		sb.WriteString(MutedStyle.Padding(0, 1).Render("Auth not configured") + "\n")
+		sb.WriteString(MutedStyle.Padding(0, 1).Render("No auth configured") + "\n")
 	}
 
-	return panelStyle.
-		Width(p.Width - 2).
-		Height(p.Height - 2).
-		Render(sb.String())
+	return style.Width(p.Width - 2).Height(p.Height - 2).Render(sb.String())
 }

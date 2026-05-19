@@ -28,7 +28,7 @@ const (
 	PanelRequests
 	PanelEditor
 	PanelResponse
-	PanelCount // sentinel — always last
+	PanelCount
 )
 
 func (p Panel) String() string {
@@ -45,3 +45,15 @@ func (p Panel) String() string {
 		return ""
 	}
 }
+
+type AppState int
+
+const (
+	StateDefault AppState = iota
+	StateHelp
+	StateNewCollection
+	StateNewRequest
+	StateRename
+	StateDeleteConfirm
+	StateSearching
+)

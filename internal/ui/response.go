@@ -1,9 +1,14 @@
 package ui
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"strings"
 
+	"github.com/alecthomas/chroma/v2/formatters"
+	"github.com/alecthomas/chroma/v2/lexers"
+	"github.com/alecthomas/chroma/v2/styles"
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hieuhm2/lazyapi/internal/storage"
@@ -41,14 +46,13 @@ type ResponsePanel struct {
 }
 
 func NewResponsePanel() ResponsePanel {
-	vp := viewport.New(0, 0)
-	return ResponsePanel{Viewport: vp}
+	return ResponsePanel{Viewport: viewport.New(0, 0)}
 }
 
 func (p *ResponsePanel) SetResponse(r *storage.Response) {
 	p.Response = r
 	p.Loading = false
-	p.updateViewport()
+	p.refreshContent()
 }
 
 func (p *ResponsePanel) SetLoading() {
@@ -57,24 +61,27 @@ func (p *ResponsePanel) SetLoading() {
 
 func (p *ResponsePanel) NextTab() {
 	p.ActiveTab = ResponseTab((int(p.ActiveTab) + 1) % 3)
-	p.updateViewport()
+	p.refreshContent()
 }
 
-func (p *ResponsePanel) updateViewport() {
+func (p *ResponsePanel) refreshContent() {
 	if p.Response == nil {
 		return
 	}
-	content := p.currentTabContent()
-	p.Viewport.SetContent(content)
+	p.Viewport.SetContent(p.tabContent())
+	p.Viewport.GotoTop()
 }
 
-func (p ResponsePanel) currentTabContent() string {
+func (p ResponsePanel) tabContent() string {
 	if p.Response == nil {
 		return ""
 	}
 	switch p.ActiveTab {
 	case ResponseTabBody:
-		return p.Response.Body
+		if p.Response.Error != "" {
+			return lipgloss.NewStyle().Foreground(ColorError).Render(p.Response.Error)
+		}
+		return highlightBody(p.Response.Body, p.Response.ContentType)
 	case ResponseTabHeaders:
 		var sb strings.Builder
 		for k, vals := range p.Response.Headers {
@@ -83,29 +90,33 @@ func (p ResponsePanel) currentTabContent() string {
 		}
 		return sb.String()
 	case ResponseTabRaw:
-		return fmt.Sprintf("HTTP/1.1 %s\n\n%s", p.Response.Status, p.Response.Body)
+		var hdr strings.Builder
+		for k, vals := range p.Response.Headers {
+			hdr.WriteString(fmt.Sprintf("%s: %s\n", k, strings.Join(vals, ", ")))
+		}
+		return fmt.Sprintf("HTTP/1.1 %s\n%s\n%s", p.Response.Status, hdr.String(), p.Response.Body)
 	}
 	return ""
 }
 
 func (p ResponsePanel) View() string {
-	panelStyle := PanelStyle
-	titleStyle := TitleStyle
+	style := PanelStyle
 	if p.Focused {
-		panelStyle = PanelFocusedStyle
-		titleStyle = TitleFocusedStyle
+		style = PanelFocusedStyle
 	}
-
-	_ = titleStyle
 
 	var sb strings.Builder
 
-	// Status bar
+	// Status line
 	if p.Loading {
-		sb.WriteString(lipgloss.NewStyle().Foreground(ColorWarning).Bold(true).Render("  Sending request...") + "\n")
+		sb.WriteString(lipgloss.NewStyle().Foreground(ColorWarning).Bold(true).Render("  Sending...") + "\n")
+	} else if p.Response != nil && p.Response.Error != "" {
+		sb.WriteString(lipgloss.NewStyle().Foreground(ColorError).Bold(true).Render("  Error: "+p.Response.Error) + "\n")
 	} else if p.Response != nil {
 		statusColor := ColorSuccess
-		if p.Response.StatusCode >= 400 {
+		if p.Response.StatusCode >= 500 {
+			statusColor = ColorError
+		} else if p.Response.StatusCode >= 400 {
 			statusColor = ColorError
 		} else if p.Response.StatusCode >= 300 {
 			statusColor = ColorWarning
@@ -115,46 +126,108 @@ func (p ResponsePanel) View() string {
 		size := MutedStyle.Render(fmt.Sprintf("  %s", formatBytes(p.Response.SizeBytes)))
 		sb.WriteString(fmt.Sprintf(" %s%s%s\n", status, duration, size))
 	} else {
-		sb.WriteString(MutedStyle.Padding(0, 1).Render("Response will appear here") + "\n")
+		sb.WriteString(MutedStyle.Padding(0, 1).Render("Response will appear here  ·  press r to execute") + "\n")
 	}
 
-	// Tabs
+	// Tab bar
 	tabs := []ResponseTab{ResponseTabBody, ResponseTabHeaders, ResponseTabRaw}
 	tabBar := ""
 	for _, t := range tabs {
 		label := fmt.Sprintf(" %s ", t.String())
 		if t == p.ActiveTab {
-			tabBar += lipgloss.NewStyle().
-				Foreground(ColorTitleFocused).
-				Bold(true).
-				Underline(true).
-				Render(label)
+			tabBar += lipgloss.NewStyle().Foreground(ColorTitleFocused).Bold(true).Underline(true).Render(label)
 		} else {
 			tabBar += MutedStyle.Render(label)
 		}
 		tabBar += " "
 	}
 	sb.WriteString(tabBar + "\n")
-	sb.WriteString(lipgloss.NewStyle().Foreground(ColorBorder).Render(strings.Repeat("─", p.Width-6)) + "\n")
+	sb.WriteString(MutedStyle.Render(strings.Repeat("─", p.Width-6)) + "\n")
 
-	// Content
+	// Viewport
 	if p.Response != nil {
-		p.Viewport.Width = p.Width - 6
-		p.Viewport.Height = p.Height - 10
+		vpW := p.Width - 6
+		vpH := p.Height - 9
+		if vpW < 1 {
+			vpW = 1
+		}
+		if vpH < 1 {
+			vpH = 1
+		}
+		p.Viewport.Width = vpW
+		p.Viewport.Height = vpH
 		sb.WriteString(p.Viewport.View())
 	}
 
-	return panelStyle.
-		Width(p.Width - 2).
-		Height(p.Height - 2).
-		Render(sb.String())
+	return style.Width(p.Width - 2).Height(p.Height - 2).Render(sb.String())
+}
+
+func highlightBody(body, contentType string) string {
+	if body == "" {
+		return ""
+	}
+	lang := detectLang(body, contentType)
+
+	// Pretty-print JSON
+	if lang == "json" {
+		var buf bytes.Buffer
+		if err := json.Indent(&buf, []byte(body), "", "  "); err == nil {
+			body = buf.String()
+		}
+	}
+
+	lexer := lexers.Get(lang)
+	if lexer == nil {
+		return body
+	}
+
+	style := styles.Get("monokai")
+	formatter := formatters.Get("terminal256")
+	if formatter == nil {
+		return body
+	}
+
+	it, err := lexer.Tokenise(nil, body)
+	if err != nil {
+		return body
+	}
+
+	var out strings.Builder
+	if err := formatter.Format(&out, style, it); err != nil {
+		return body
+	}
+	return out.String()
+}
+
+func detectLang(body, contentType string) string {
+	ct := strings.ToLower(contentType)
+	if strings.Contains(ct, "json") {
+		return "json"
+	}
+	if strings.Contains(ct, "xml") {
+		return "xml"
+	}
+	if strings.Contains(ct, "html") {
+		return "html"
+	}
+	// Sniff content
+	body = strings.TrimSpace(body)
+	if len(body) > 0 && (body[0] == '{' || body[0] == '[') {
+		return "json"
+	}
+	if strings.HasPrefix(body, "<?xml") || strings.HasPrefix(body, "<") {
+		return "xml"
+	}
+	return "text"
 }
 
 func formatBytes(b int64) string {
-	if b < 1024 {
+	switch {
+	case b < 1024:
 		return fmt.Sprintf("%d B", b)
-	} else if b < 1024*1024 {
+	case b < 1024*1024:
 		return fmt.Sprintf("%.1f KB", float64(b)/1024)
+	default:
+		return fmt.Sprintf("%.1f MB", float64(b)/(1024*1024))
 	}
-	return fmt.Sprintf("%.1f MB", float64(b)/(1024*1024))
 }

@@ -15,12 +15,23 @@ type Request struct {
 	Body    string            `json:"body"`
 }
 
+type Environment struct {
+	Name      string            `json:"name"`
+	Variables map[string]string `json:"variables"`
+}
+
+type EnvFile struct {
+	Active string        `json:"active"`
+	Envs   []Environment `json:"envs"`
+}
+
 type Response struct {
-	StatusCode int
-	Status     string
-	Headers    map[string][]string
-	Body       string
-	DurationMs int64
-	SizeBytes  int64
-	Error      string
+	StatusCode  int
+	Status      string
+	Headers     map[string][]string
+	Body        string
+	ContentType string
+	DurationMs  int64
+	SizeBytes   int64
+	Error       string
 }

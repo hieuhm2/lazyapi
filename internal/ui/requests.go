@@ -1,27 +1,55 @@
 package ui
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hieuhm2/lazyapi/internal/storage"
 )
 
 type RequestsPanel struct {
-	Requests []storage.Request
-	Cursor   int
-	Focused  bool
-	Width    int
-	Height   int
+	Cursor  int
+	Filter  string
+	Focused bool
+	Width   int
+	Height  int
 }
 
-func NewRequestsPanel() RequestsPanel {
-	return RequestsPanel{}
+func (p *RequestsPanel) SetFilter(f string) {
+	p.Filter = f
+	p.Cursor = 0
 }
 
-func (p *RequestsPanel) SetRequests(reqs []storage.Request) {
-	p.Requests = reqs
-	if p.Cursor >= len(reqs) {
-		p.Cursor = 0
+func (p RequestsPanel) Filtered(reqs []storage.Request) []storage.Request {
+	if p.Filter == "" {
+		return reqs
 	}
+	f := strings.ToLower(p.Filter)
+	var out []storage.Request
+	for _, r := range reqs {
+		if strings.Contains(strings.ToLower(r.Name), f) ||
+			strings.Contains(strings.ToLower(r.URL), f) ||
+			strings.Contains(strings.ToLower(r.Method), f) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// SelectedIdx returns the index in the original slice of the cursor item.
+func (p RequestsPanel) SelectedIdx(reqs []storage.Request) int {
+	filtered := p.Filtered(reqs)
+	if len(filtered) == 0 || p.Cursor >= len(filtered) {
+		return -1
+	}
+	target := filtered[p.Cursor].ID
+	for i, r := range reqs {
+		if r.ID == target {
+			return i
+		}
+	}
+	return -1
 }
 
 func (p *RequestsPanel) MoveUp() {
@@ -30,66 +58,59 @@ func (p *RequestsPanel) MoveUp() {
 	}
 }
 
-func (p *RequestsPanel) MoveDown() {
-	if p.Cursor < len(p.Requests)-1 {
+func (p *RequestsPanel) MoveDown(reqs []storage.Request) {
+	max := len(p.Filtered(reqs)) - 1
+	if p.Cursor < max {
 		p.Cursor++
 	}
 }
 
-func (p *RequestsPanel) GoTop() {
-	p.Cursor = 0
-}
+func (p *RequestsPanel) GoTop() { p.Cursor = 0 }
 
-func (p *RequestsPanel) GoBottom() {
-	if len(p.Requests) > 0 {
-		p.Cursor = len(p.Requests) - 1
+func (p *RequestsPanel) GoBottom(reqs []storage.Request) {
+	n := len(p.Filtered(reqs))
+	if n > 0 {
+		p.Cursor = n - 1
 	}
 }
 
-func (p *RequestsPanel) Selected() *storage.Request {
-	if len(p.Requests) == 0 {
-		return nil
-	}
-	return &p.Requests[p.Cursor]
-}
-
-func (p RequestsPanel) View() string {
-	panelStyle := PanelStyle
-	titleStyle := TitleStyle
+func (p RequestsPanel) View(reqs []storage.Request) string {
+	style := PanelStyle
+	titleSt := TitleStyle
 	if p.Focused {
-		panelStyle = PanelFocusedStyle
-		titleStyle = TitleFocusedStyle
+		style = PanelFocusedStyle
+		titleSt = TitleFocusedStyle
 	}
 
-	title := titleStyle.Render("Requests")
-	inner := lipgloss.NewStyle().Width(p.Width - 4).Height(p.Height - 4)
-
-	content := title + "\n"
-
-	if len(p.Requests) == 0 {
-		content += MutedStyle.Padding(0, 1).Render("No requests") + "\n"
+	filtered := p.Filtered(reqs)
+	title := titleSt.Render("Requests")
+	if p.Filter != "" {
+		title = titleSt.Render(fmt.Sprintf("Requests /%s", p.Filter))
 	}
 
-	for i, r := range p.Requests {
-		method := MethodStyle(r.Method).Render(r.Method)
-		name := r.Name
-		line := method + " " + name
+	var sb strings.Builder
+	sb.WriteString(title + "\n")
 
-		if i == p.Cursor && p.Focused {
-			content += SelectedItemStyle.Width(p.Width - 6).Render(line) + "\n"
-		} else if i == p.Cursor {
-			content += lipgloss.NewStyle().
-				Foreground(ColorSelectedText).
-				Width(p.Width - 6).
-				Padding(0, 1).
-				Render(line) + "\n"
+	if len(filtered) == 0 {
+		if len(reqs) == 0 {
+			sb.WriteString(MutedStyle.Padding(0, 1).Render("No requests") + "\n")
 		} else {
-			content += NormalItemStyle.Width(p.Width - 6).Render(line) + "\n"
+			sb.WriteString(MutedStyle.Padding(0, 1).Render("No matches") + "\n")
 		}
 	}
 
-	return panelStyle.
-		Width(p.Width - 2).
-		Height(p.Height - 2).
-		Render(inner.Render(content))
+	for i, r := range filtered {
+		method := MethodStyle(r.Method).Render(r.Method)
+		line := method + " " + r.Name
+		itemW := p.Width - 6
+		if i == p.Cursor && p.Focused {
+			sb.WriteString(SelectedItemStyle.Width(itemW).Render(method+" "+r.Name) + "\n")
+		} else if i == p.Cursor {
+			sb.WriteString(lipgloss.NewStyle().Foreground(ColorSelectedText).Width(itemW).Padding(0, 1).Render(line) + "\n")
+		} else {
+			sb.WriteString(NormalItemStyle.Width(itemW).Render(line) + "\n")
+		}
+	}
+
+	return style.Width(p.Width - 2).Height(p.Height - 2).Render(sb.String())
 }

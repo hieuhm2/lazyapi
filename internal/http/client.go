@@ -42,13 +42,15 @@ func Execute(req storage.Request) storage.Response {
 	}
 
 	elapsed := time.Since(start)
+	ct := resp.Header.Get("Content-Type")
 
 	return storage.Response{
-		StatusCode: resp.StatusCode,
-		Status:     resp.Status,
-		Headers:    resp.Header,
-		Body:       string(body),
-		DurationMs: elapsed.Milliseconds(),
-		SizeBytes:  int64(len(body)),
+		StatusCode:  resp.StatusCode,
+		Status:      resp.Status,
+		Headers:     resp.Header,
+		Body:        string(body),
+		ContentType: ct,
+		DurationMs:  elapsed.Milliseconds(),
+		SizeBytes:   int64(len(body)),
 	}
 }
