@@ -14,7 +14,7 @@ import (
 	"github.com/hieuhm2/lazyapi/internal/ui"
 )
 
-// ── messages ────────────────────────────────────────────────────────────────
+// ── messages ─────────────────────────────────────────────────────────────────
 
 type responseMsg struct{ resp storage.Response }
 type savedMsg struct{ err error }
@@ -23,47 +23,39 @@ type editorDoneMsg struct {
 	err     error
 }
 
-// ── App ─────────────────────────────────────────────────────────────────────
+// ── App ───────────────────────────────────────────────────────────────────────
 
 type App struct {
-	// Core state
 	mode    Mode
 	state   AppState
 	focused Panel
 
-	// Vim motion helpers
 	ggPressed bool
 
-	// Terminal size
 	width, height int
 
-	// Data (source of truth lives here)
+	// Data
 	collections []storage.Collection
-	colIdx      int // selected collection index
-	reqIdx      int // selected request index
+	reqIdx      int
 	envFile     storage.EnvFile
 	activeEnv   *storage.Environment
 
-	// Panels (view state only)
-	colPanel  ui.CollectionsPanel
-	reqPanel  ui.RequestsPanel
-	editor    ui.EditorPanel
-	response  ui.ResponsePanel
+	// Panels
+	colPanel ui.CollectionsPanel
+	reqPanel ui.RequestsPanel
+	editor   ui.EditorPanel
+	response ui.ResponsePanel
 
-	// Overlay inputs
-	overlayInput textinput.Model
-	overlayTitle string
-	deleteTarget string
+	// Overlay
+	overlayInput     textinput.Model
+	overlayTitle     string
+	deleteTarget     string
+	pendingHeaderKey string
 
 	// Search
 	searchInput textinput.Model
 
-	// Header editing (two-step input)
-	pendingHeaderKey string
-
-	// Persistence
-	store *storage.Store
-
+	store     *storage.Store
 	statusMsg string
 }
 
@@ -79,22 +71,20 @@ func New() App {
 		mode:         ModeNormal,
 		state:        StateDefault,
 		focused:      PanelCollections,
+		colPanel:     ui.NewCollectionsPanel(),
 		editor:       ui.NewEditorPanel(),
 		response:     ui.NewResponsePanel(),
 		overlayInput: overlayIn,
 		searchInput:  searchIn,
 	}
 
-	// Load from disk (fall back to defaults on error)
 	store, err := storage.NewStore()
 	if err == nil {
 		a.store = store
-		cols, err := store.LoadCollections()
-		if err == nil {
+		if cols, err := store.LoadCollections(); err == nil {
 			a.collections = cols
 		}
-		ef, err := store.LoadEnvFile()
-		if err == nil {
+		if ef, err := store.LoadEnvFile(); err == nil {
 			a.envFile = ef
 		}
 	}
@@ -105,14 +95,14 @@ func New() App {
 		a.envFile = storage.DefaultEnvFile()
 	}
 	a.syncActiveEnv()
-	a.syncPanels()
+	a.syncEditor()
 	a.syncFocus()
 	return a
 }
 
 func (a App) Init() tea.Cmd { return nil }
 
-// ── Update ───────────────────────────────────────────────────────────────────
+// ── Update ────────────────────────────────────────────────────────────────────
 
 func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -127,23 +117,17 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if r.Error != "" {
 			a.statusMsg = "Error: " + r.Error
 		} else {
-			a.statusMsg = fmt.Sprintf("%s  ·  %dms  ·  %s",
-				r.Status,
-				r.DurationMs,
-				formatSize(r.SizeBytes),
-			)
+			a.statusMsg = fmt.Sprintf("%s  ·  %dms  ·  %s", r.Status, r.DurationMs, formatSize(r.SizeBytes))
 		}
 		return a, nil
 
 	case editorDoneMsg:
-		if msg.err == nil && msg.content != "" {
-			if a.colIdx < len(a.collections) {
-				reqs := a.collections[a.colIdx].Requests
-				if a.reqIdx < len(reqs) {
-					a.collections[a.colIdx].Requests[a.reqIdx].Body = msg.content
-					a.editor.SetRequest(&a.collections[a.colIdx].Requests[a.reqIdx])
-					return a, a.save()
-				}
+		if msg.err == nil {
+			col := a.currentCollection()
+			if col != nil && a.reqIdx < len(col.Requests) {
+				col.Requests[a.reqIdx].Body = msg.content
+				a.editor.SetRequest(&col.Requests[a.reqIdx])
+				return a, a.save()
 			}
 		}
 		return a, nil
@@ -183,12 +167,11 @@ func (a App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
-// ── Normal mode ──────────────────────────────────────────────────────────────
+// ── Normal mode ───────────────────────────────────────────────────────────────
 
 func (a App) handleNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	k := msg.String()
 
-	// Panel jumps
 	switch k {
 	case "1":
 		a.focused = PanelCollections
@@ -221,9 +204,16 @@ func (a App) handleNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	// Actions (with per-tab overrides for the editor panel)
+	// Actions (with panel/tab-specific overrides)
 	switch k {
-	case "r", "enter":
+	case "r":
+		return a.executeRequest()
+	case "enter":
+		if a.focused == PanelCollections {
+			a.colPanel.Toggle(a.collections)
+			a.syncEditor()
+			return a, nil
+		}
 		return a.executeRequest()
 	case "n":
 		if a.focused == PanelEditor && a.editor.ActiveTab == ui.EditorTabHeaders {
@@ -246,12 +236,10 @@ func (a App) handleNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "m":
 		if a.focused == PanelEditor {
 			a.editor.CycleMethod()
-			if a.colIdx < len(a.collections) {
-				reqs := a.collections[a.colIdx].Requests
-				if a.reqIdx < len(reqs) {
-					a.collections[a.colIdx].Requests[a.reqIdx].Method = a.editor.Request.Method
-					return a, a.save()
-				}
+			col := a.currentCollection()
+			if col != nil && a.reqIdx < len(col.Requests) {
+				col.Requests[a.reqIdx].Method = a.editor.Request.Method
+				return a, a.save()
 			}
 		}
 		return a, nil
@@ -281,7 +269,6 @@ func (a App) handleNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.state = StateSearching
 			a.searchInput.SetValue("")
 			a.searchInput.Focus()
-			a.statusMsg = ""
 		}
 		return a, nil
 	}
@@ -316,25 +303,35 @@ func (a App) handleNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+u":
 		a.halfUp()
 	case "l", "right":
-		switch a.focused {
-		case PanelCollections:
-			a.focused = PanelRequests
-		case PanelRequests:
+		if a.focused == PanelCollections {
+			if a.colPanel.SelectedHasKids(a.collections) && !a.colPanel.Expanded[a.currentColID()] {
+				// expand in place instead of jumping
+				a.colPanel.Toggle(a.collections)
+			} else {
+				a.focused = PanelRequests
+				a.syncFocus()
+			}
+		} else if a.focused == PanelRequests {
 			a.focused = PanelEditor
-		case PanelEditor:
+			a.syncFocus()
+		} else if a.focused == PanelEditor {
 			a.focused = PanelResponse
+			a.syncFocus()
 		}
-		a.syncFocus()
 	case "h", "left":
-		switch a.focused {
-		case PanelResponse:
+		if a.focused == PanelCollections {
+			a.colPanel.CollapseToParent(a.collections)
+			a.syncEditor()
+		} else if a.focused == PanelResponse {
 			a.focused = PanelEditor
-		case PanelEditor:
+			a.syncFocus()
+		} else if a.focused == PanelEditor {
 			a.focused = PanelRequests
-		case PanelRequests:
+			a.syncFocus()
+		} else if a.focused == PanelRequests {
 			a.focused = PanelCollections
+			a.syncFocus()
 		}
-		a.syncFocus()
 	}
 
 	a.ggPressed = false
@@ -348,23 +345,19 @@ func (a App) handleInsert(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.mode = ModeNormal
 		a.editor.InsertMode = false
 		a.editor.URLInput.Blur()
-		// Write URL back to source
-		if a.colIdx < len(a.collections) {
-			reqs := a.collections[a.colIdx].Requests
-			if a.reqIdx < len(reqs) {
-				a.collections[a.colIdx].Requests[a.reqIdx].URL = a.editor.URLInput.Value()
-				return a, a.save()
-			}
+		col := a.currentCollection()
+		if col != nil && a.reqIdx < len(col.Requests) {
+			col.Requests[a.reqIdx].URL = a.editor.URLInput.Value()
+			return a, a.save()
 		}
 		return a, nil
 	}
-
 	var cmd tea.Cmd
 	a.editor.URLInput, cmd = a.editor.URLInput.Update(msg)
 	return a, cmd
 }
 
-// ── Overlay (new/rename/header editing) ─────────────────────────────────────
+// ── Overlay ───────────────────────────────────────────────────────────────────
 
 func (a App) handleOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == "esc" {
@@ -373,37 +366,46 @@ func (a App) handleOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.pendingHeaderKey = ""
 		return a, nil
 	}
-
 	if msg.String() != "enter" {
 		var cmd tea.Cmd
 		a.overlayInput, cmd = a.overlayInput.Update(msg)
 		return a, cmd
 	}
 
-	// Enter pressed — dispatch per state
 	switch a.state {
 	case StateNewCollection:
 		val := strings.TrimSpace(a.overlayInput.Value())
 		if val != "" {
-			a.collections = append(a.collections, storage.Collection{ID: storage.NewID(), Name: val})
-			a.colIdx = len(a.collections) - 1
-			a.reqIdx = 0
+			newCol := storage.Collection{ID: storage.NewID(), Name: val}
+			// Add at same level as current selection
+			path := a.colPanel.SelectedPath(a.collections)
+			if len(path) <= 1 {
+				a.collections = append(a.collections, newCol)
+			} else {
+				parentPath := path[:len(path)-1]
+				parent := getCollByPath(a.collections, parentPath)
+				if parent != nil {
+					parent.Children = append(parent.Children, newCol)
+				}
+			}
 		}
 		a.state = StateDefault
 		a.overlayInput.Blur()
-		a.syncPanels()
 		return a, a.save()
 
 	case StateNewRequest:
 		val := strings.TrimSpace(a.overlayInput.Value())
-		if val != "" && a.colIdx < len(a.collections) {
-			newReq := storage.Request{ID: storage.NewID(), Name: val, Method: "GET"}
-			a.collections[a.colIdx].Requests = append(a.collections[a.colIdx].Requests, newReq)
-			a.reqIdx = len(a.collections[a.colIdx].Requests) - 1
+		if val != "" {
+			col := a.currentCollection()
+			if col != nil {
+				newReq := storage.Request{ID: storage.NewID(), Name: val, Method: "GET"}
+				col.Requests = append(col.Requests, newReq)
+				a.reqIdx = len(col.Requests) - 1
+				a.syncEditor()
+			}
 		}
 		a.state = StateDefault
 		a.overlayInput.Blur()
-		a.syncPanels()
 		return a, a.save()
 
 	case StateRename:
@@ -411,21 +413,19 @@ func (a App) handleOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if val != "" {
 			switch a.focused {
 			case PanelCollections:
-				if a.colIdx < len(a.collections) {
-					a.collections[a.colIdx].Name = val
+				col := a.currentCollection()
+				if col != nil {
+					col.Name = val
 				}
 			case PanelRequests:
-				if a.colIdx < len(a.collections) {
-					reqs := a.collections[a.colIdx].Requests
-					if a.reqIdx < len(reqs) {
-						a.collections[a.colIdx].Requests[a.reqIdx].Name = val
-					}
+				col := a.currentCollection()
+				if col != nil && a.reqIdx < len(col.Requests) {
+					col.Requests[a.reqIdx].Name = val
 				}
 			}
 		}
 		a.state = StateDefault
 		a.overlayInput.Blur()
-		a.syncPanels()
 		return a, a.save()
 
 	case StateNewHeaderKey:
@@ -435,24 +435,21 @@ func (a App) handleOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.overlayInput.Blur()
 			return a, nil
 		}
-		// Step 2: ask for the value
 		a.pendingHeaderKey = key
 		a.state = StateNewHeaderValue
 		a.overlayTitle = fmt.Sprintf("Value for '%s'", key)
 		a.overlayInput.Placeholder = "header value"
 		a.overlayInput.SetValue("")
-		return a, nil // stay in overlay
+		return a, nil
 
 	case StateNewHeaderValue:
-		if a.colIdx < len(a.collections) {
-			reqs := a.collections[a.colIdx].Requests
-			if a.reqIdx < len(reqs) {
-				if a.collections[a.colIdx].Requests[a.reqIdx].Headers == nil {
-					a.collections[a.colIdx].Requests[a.reqIdx].Headers = make(map[string]string)
-				}
-				a.collections[a.colIdx].Requests[a.reqIdx].Headers[a.pendingHeaderKey] = a.overlayInput.Value()
-				a.editor.SetRequest(&a.collections[a.colIdx].Requests[a.reqIdx])
+		col := a.currentCollection()
+		if col != nil && a.reqIdx < len(col.Requests) {
+			if col.Requests[a.reqIdx].Headers == nil {
+				col.Requests[a.reqIdx].Headers = make(map[string]string)
 			}
+			col.Requests[a.reqIdx].Headers[a.pendingHeaderKey] = a.overlayInput.Value()
+			a.editor.SetRequest(&col.Requests[a.reqIdx])
 		}
 		a.pendingHeaderKey = ""
 		a.state = StateDefault
@@ -461,11 +458,11 @@ func (a App) handleOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case StateEditHeaderValue:
 		hKey := a.editor.SelectedHeaderKey()
-		if hKey != "" && a.colIdx < len(a.collections) {
-			reqs := a.collections[a.colIdx].Requests
-			if a.reqIdx < len(reqs) {
-				a.collections[a.colIdx].Requests[a.reqIdx].Headers[hKey] = a.overlayInput.Value()
-				a.editor.SetRequest(&a.collections[a.colIdx].Requests[a.reqIdx])
+		if hKey != "" {
+			col := a.currentCollection()
+			if col != nil && a.reqIdx < len(col.Requests) {
+				col.Requests[a.reqIdx].Headers[hKey] = a.overlayInput.Value()
+				a.editor.SetRequest(&col.Requests[a.reqIdx])
 			}
 		}
 		a.state = StateDefault
@@ -483,30 +480,30 @@ func (a App) handleDeleteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "y", "Y":
 		switch a.focused {
 		case PanelCollections:
-			if a.colIdx < len(a.collections) {
-				a.collections = append(a.collections[:a.colIdx], a.collections[a.colIdx+1:]...)
-				if a.colIdx > 0 {
-					a.colIdx--
+			path := a.colPanel.SelectedPath(a.collections)
+			if len(path) > 0 {
+				a.collections = deleteCollAt(a.collections, path)
+				// Clamp cursor
+				nodes := ui.BuildTree(a.collections, a.colPanel.Expanded, 0, nil)
+				if a.colPanel.Cursor >= len(nodes) && len(nodes) > 0 {
+					a.colPanel.Cursor = len(nodes) - 1
 				}
 				a.reqIdx = 0
 			}
 		case PanelRequests:
-			if a.colIdx < len(a.collections) {
-				reqs := a.collections[a.colIdx].Requests
-				if a.reqIdx < len(reqs) {
-					a.collections[a.colIdx].Requests = append(reqs[:a.reqIdx], reqs[a.reqIdx+1:]...)
-					if a.reqIdx > 0 {
-						a.reqIdx--
-					}
+			col := a.currentCollection()
+			if col != nil && a.reqIdx < len(col.Requests) {
+				col.Requests = append(col.Requests[:a.reqIdx], col.Requests[a.reqIdx+1:]...)
+				if a.reqIdx > 0 {
+					a.reqIdx--
 				}
 			}
 		}
 		a.state = StateDefault
-		a.syncPanels()
+		a.syncEditor()
 		return a, a.save()
 	case "n", "N", "esc":
 		a.state = StateDefault
-		return a, nil
 	}
 	return a, nil
 }
@@ -524,21 +521,19 @@ func (a App) handleSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if a.focused == PanelCollections {
 			a.colPanel.SetFilter(filter)
-			// sync colIdx to filtered cursor
-			idx := a.colPanel.SelectedIdx(a.collections)
-			if idx >= 0 {
-				a.colIdx = idx
-			}
 		} else {
 			a.reqPanel.SetFilter(filter)
-			if a.colIdx < len(a.collections) {
-				idx := a.reqPanel.SelectedIdx(a.collections[a.colIdx].Requests)
-				if idx >= 0 {
-					a.reqIdx = idx
+			if msg.String() == "enter" {
+				col := a.currentCollection()
+				if col != nil {
+					idx := a.reqPanel.SelectedIdx(col.Requests)
+					if idx >= 0 {
+						a.reqIdx = idx
+					}
 				}
 			}
 		}
-		a.syncPanels()
+		a.syncEditor()
 		return a, nil
 	}
 	var cmd tea.Cmd
@@ -546,24 +541,20 @@ func (a App) handleSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return a, cmd
 }
 
-// ── Navigation helpers ────────────────────────────────────────────────────────
+// ── Navigation ────────────────────────────────────────────────────────────────
 
 func (a *App) moveDown() {
 	switch a.focused {
 	case PanelCollections:
 		a.colPanel.MoveDown(a.collections)
-		idx := a.colPanel.SelectedIdx(a.collections)
-		if idx >= 0 {
-			a.colIdx = idx
-		}
 		a.reqIdx = 0
 		a.reqPanel.Cursor = 0
 		a.syncEditor()
 	case PanelRequests:
-		if a.colIdx < len(a.collections) {
-			reqs := a.collections[a.colIdx].Requests
-			a.reqPanel.MoveDown(reqs)
-			idx := a.reqPanel.SelectedIdx(reqs)
+		col := a.currentCollection()
+		if col != nil {
+			a.reqPanel.MoveDown(col.Requests)
+			idx := a.reqPanel.SelectedIdx(col.Requests)
 			if idx >= 0 {
 				a.reqIdx = idx
 			}
@@ -578,17 +569,14 @@ func (a *App) moveUp() {
 	switch a.focused {
 	case PanelCollections:
 		a.colPanel.MoveUp()
-		idx := a.colPanel.SelectedIdx(a.collections)
-		if idx >= 0 {
-			a.colIdx = idx
-		}
 		a.reqIdx = 0
 		a.reqPanel.Cursor = 0
 		a.syncEditor()
 	case PanelRequests:
 		a.reqPanel.MoveUp()
-		if a.colIdx < len(a.collections) {
-			idx := a.reqPanel.SelectedIdx(a.collections[a.colIdx].Requests)
+		col := a.currentCollection()
+		if col != nil {
+			idx := a.reqPanel.SelectedIdx(col.Requests)
 			if idx >= 0 {
 				a.reqIdx = idx
 			}
@@ -603,7 +591,6 @@ func (a *App) goTop() {
 	switch a.focused {
 	case PanelCollections:
 		a.colPanel.GoTop()
-		a.colIdx = 0
 		a.reqIdx = 0
 		a.reqPanel.Cursor = 0
 		a.syncEditor()
@@ -620,18 +607,14 @@ func (a *App) goBottom() {
 	switch a.focused {
 	case PanelCollections:
 		a.colPanel.GoBottom(a.collections)
-		idx := a.colPanel.SelectedIdx(a.collections)
-		if idx >= 0 {
-			a.colIdx = idx
-		}
 		a.reqIdx = 0
 		a.reqPanel.Cursor = 0
 		a.syncEditor()
 	case PanelRequests:
-		if a.colIdx < len(a.collections) {
-			reqs := a.collections[a.colIdx].Requests
-			a.reqPanel.GoBottom(reqs)
-			idx := a.reqPanel.SelectedIdx(reqs)
+		col := a.currentCollection()
+		if col != nil {
+			a.reqPanel.GoBottom(col.Requests)
+			idx := a.reqPanel.SelectedIdx(col.Requests)
 			if idx >= 0 {
 				a.reqIdx = idx
 			}
@@ -663,8 +646,8 @@ func (a App) startNew() (tea.Model, tea.Cmd) {
 		a.overlayTitle = "New Collection"
 		a.overlayInput.Placeholder = "collection name"
 	case PanelRequests:
-		if len(a.collections) == 0 {
-			a.statusMsg = "Create a collection first"
+		if a.currentCollection() == nil {
+			a.statusMsg = "Select a collection first"
 			return a, nil
 		}
 		a.state = StateNewRequest
@@ -681,17 +664,16 @@ func (a App) startNew() (tea.Model, tea.Cmd) {
 func (a App) startDelete() (tea.Model, tea.Cmd) {
 	switch a.focused {
 	case PanelCollections:
-		if a.colIdx < len(a.collections) {
-			a.deleteTarget = a.collections[a.colIdx].Name
+		col := a.currentCollection()
+		if col != nil {
+			a.deleteTarget = col.Name
 			a.state = StateDeleteConfirm
 		}
 	case PanelRequests:
-		if a.colIdx < len(a.collections) {
-			reqs := a.collections[a.colIdx].Requests
-			if a.reqIdx < len(reqs) {
-				a.deleteTarget = reqs[a.reqIdx].Name
-				a.state = StateDeleteConfirm
-			}
+		col := a.currentCollection()
+		if col != nil && a.reqIdx < len(col.Requests) {
+			a.deleteTarget = col.Requests[a.reqIdx].Name
+			a.state = StateDeleteConfirm
 		}
 	}
 	return a, nil
@@ -701,15 +683,14 @@ func (a App) startRename() (tea.Model, tea.Cmd) {
 	var current string
 	switch a.focused {
 	case PanelCollections:
-		if a.colIdx < len(a.collections) {
-			current = a.collections[a.colIdx].Name
+		col := a.currentCollection()
+		if col != nil {
+			current = col.Name
 		}
 	case PanelRequests:
-		if a.colIdx < len(a.collections) {
-			reqs := a.collections[a.colIdx].Requests
-			if a.reqIdx < len(reqs) {
-				current = reqs[a.reqIdx].Name
-			}
+		col := a.currentCollection()
+		if col != nil && a.reqIdx < len(col.Requests) {
+			current = col.Requests[a.reqIdx].Name
 		}
 	default:
 		return a, nil
@@ -736,14 +717,12 @@ func (a App) deleteSelectedHeader() (tea.Model, tea.Cmd) {
 	if key == "" {
 		return a, nil
 	}
-	if a.colIdx < len(a.collections) {
-		reqs := a.collections[a.colIdx].Requests
-		if a.reqIdx < len(reqs) {
-			delete(a.collections[a.colIdx].Requests[a.reqIdx].Headers, key)
-			a.editor.SetRequest(&a.collections[a.colIdx].Requests[a.reqIdx])
-			if a.editor.HeaderCursor > 0 {
-				a.editor.HeaderCursor--
-			}
+	col := a.currentCollection()
+	if col != nil && a.reqIdx < len(col.Requests) {
+		delete(col.Requests[a.reqIdx].Headers, key)
+		a.editor.SetRequest(&col.Requests[a.reqIdx])
+		if a.editor.HeaderCursor > 0 {
+			a.editor.HeaderCursor--
 		}
 	}
 	return a, a.save()
@@ -755,11 +734,9 @@ func (a App) startEditHeader() (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 	currentVal := ""
-	if a.colIdx < len(a.collections) {
-		reqs := a.collections[a.colIdx].Requests
-		if a.reqIdx < len(reqs) {
-			currentVal = reqs[a.reqIdx].Headers[key]
-		}
+	col := a.currentCollection()
+	if col != nil && a.reqIdx < len(col.Requests) {
+		currentVal = col.Requests[a.reqIdx].Headers[key]
 	}
 	a.state = StateEditHeaderValue
 	a.overlayTitle = fmt.Sprintf("Edit '%s'", key)
@@ -788,22 +765,17 @@ func (a App) cycleEnv() (tea.Model, tea.Cmd) {
 }
 
 func (a App) executeRequest() (tea.Model, tea.Cmd) {
-	if len(a.collections) == 0 {
-		a.statusMsg = "No collections"
+	col := a.currentCollection()
+	if col == nil || len(col.Requests) == 0 {
+		a.statusMsg = "No request selected"
 		return a, nil
 	}
-	if a.colIdx >= len(a.collections) {
-		return a, nil
-	}
-	reqs := a.collections[a.colIdx].Requests
-	if len(reqs) == 0 || a.reqIdx >= len(reqs) {
+	if a.reqIdx >= len(col.Requests) {
 		a.statusMsg = "No request selected"
 		return a, nil
 	}
 
-	req := reqs[a.reqIdx]
-
-	// Resolve environment variables
+	req := col.Requests[a.reqIdx]
 	req.URL = storage.ResolveEnv(req.URL, a.activeEnv)
 	resolved := make(map[string]string)
 	for k, v := range req.Headers {
@@ -814,7 +786,6 @@ func (a App) executeRequest() (tea.Model, tea.Cmd) {
 
 	a.response.SetLoading()
 	a.statusMsg = fmt.Sprintf("Sending %s %s…", req.Method, req.URL)
-
 	return a, func() tea.Msg {
 		return responseMsg{resp: httpclient.Execute(req)}
 	}
@@ -822,18 +793,15 @@ func (a App) executeRequest() (tea.Model, tea.Cmd) {
 
 func (a App) openExternalEditor() (tea.Model, tea.Cmd) {
 	body := ""
-	if a.colIdx < len(a.collections) {
-		reqs := a.collections[a.colIdx].Requests
-		if a.reqIdx < len(reqs) {
-			body = reqs[a.reqIdx].Body
-		}
+	col := a.currentCollection()
+	if col != nil && a.reqIdx < len(col.Requests) {
+		body = col.Requests[a.reqIdx].Body
 	}
 
 	editor := os.Getenv("EDITOR")
 	if editor == "" {
 		editor = "vi"
 	}
-
 	f, err := os.CreateTemp("", "lazyapi-*.json")
 	if err != nil {
 		a.statusMsg = "Cannot open editor: " + err.Error()
@@ -853,6 +821,44 @@ func (a App) openExternalEditor() (tea.Model, tea.Cmd) {
 	})
 }
 
+// ── Tree helpers ──────────────────────────────────────────────────────────────
+
+// getCollByPath walks the path and returns a pointer to the collection.
+// Modifications through the pointer propagate to a.collections.
+func getCollByPath(cols []storage.Collection, path []int) *storage.Collection {
+	if len(path) == 0 || path[0] >= len(cols) {
+		return nil
+	}
+	if len(path) == 1 {
+		return &cols[path[0]]
+	}
+	return getCollByPath(cols[path[0]].Children, path[1:])
+}
+
+// deleteCollAt removes the collection at path and returns the updated root slice.
+func deleteCollAt(cols []storage.Collection, path []int) []storage.Collection {
+	if len(path) == 0 || path[0] >= len(cols) {
+		return cols
+	}
+	if len(path) == 1 {
+		return append(cols[:path[0]], cols[path[0]+1:]...)
+	}
+	cols[path[0]].Children = deleteCollAt(cols[path[0]].Children, path[1:])
+	return cols
+}
+
+func (a App) currentCollection() *storage.Collection {
+	return getCollByPath(a.collections, a.colPanel.SelectedPath(a.collections))
+}
+
+func (a App) currentColID() string {
+	col := a.currentCollection()
+	if col == nil {
+		return ""
+	}
+	return col.ID
+}
+
 // ── Sync helpers ──────────────────────────────────────────────────────────────
 
 func (a *App) syncActiveEnv() {
@@ -865,29 +871,16 @@ func (a *App) syncActiveEnv() {
 	}
 }
 
-func (a *App) syncPanels() {
-	// Clamp indices
-	if a.colIdx >= len(a.collections) {
-		a.colIdx = max(0, len(a.collections)-1)
-	}
-	if a.colIdx < len(a.collections) {
-		reqs := a.collections[a.colIdx].Requests
-		if a.reqIdx >= len(reqs) {
-			a.reqIdx = max(0, len(reqs)-1)
-		}
-	}
-	a.syncEditor()
-}
-
 func (a *App) syncEditor() {
-	if a.colIdx < len(a.collections) {
-		reqs := a.collections[a.colIdx].Requests
-		if a.reqIdx < len(reqs) {
-			a.editor.SetRequest(&a.collections[a.colIdx].Requests[a.reqIdx])
-			return
-		}
+	col := a.currentCollection()
+	if col == nil || len(col.Requests) == 0 {
+		a.editor.SetRequest(nil)
+		return
 	}
-	a.editor.SetRequest(nil)
+	if a.reqIdx >= len(col.Requests) {
+		a.reqIdx = max(0, len(col.Requests)-1)
+	}
+	a.editor.SetRequest(&col.Requests[a.reqIdx])
 }
 
 func (a *App) syncFocus() {
@@ -934,7 +927,6 @@ func (a App) View() string {
 }
 
 func (a App) renderMain() string {
-	// Dimensions
 	statusH := 1
 	topH := (a.height - statusH) * 57 / 100
 	if topH < 10 {
@@ -960,8 +952,8 @@ func (a App) renderMain() string {
 	a.response.Height = botH
 
 	var reqs []storage.Request
-	if a.colIdx < len(a.collections) {
-		reqs = a.collections[a.colIdx].Requests
+	if col := a.currentCollection(); col != nil {
+		reqs = col.Requests
 	}
 
 	topRow := lipgloss.JoinHorizontal(lipgloss.Top,
@@ -969,8 +961,7 @@ func (a App) renderMain() string {
 		a.reqPanel.View(reqs),
 		a.editor.View(),
 	)
-	botRow := a.response.View()
-	return lipgloss.JoinVertical(lipgloss.Left, topRow, botRow, a.renderStatusBar())
+	return lipgloss.JoinVertical(lipgloss.Left, topRow, a.response.View(), a.renderStatusBar())
 }
 
 func (a App) renderStatusBar() string {
@@ -984,23 +975,18 @@ func (a App) renderStatusBar() string {
 	modeLabel := lipgloss.NewStyle().
 		Background(modeColor).
 		Foreground(lipgloss.Color("#1A1B26")).
-		Bold(true).
-		Padding(0, 1).
+		Bold(true).Padding(0, 1).
 		Render(a.mode.String())
 
 	panel := ui.MutedStyle.Render("  " + a.focused.String() + "  ")
 
-	// Environment indicator
 	envLabel := ""
 	if a.envFile.Active != "" {
-		envLabel = lipgloss.NewStyle().
-			Foreground(ui.ColorMethodPATCH).
+		envLabel = lipgloss.NewStyle().Foreground(ui.ColorMethodPATCH).
 			Render("  [" + a.envFile.Active + "]")
 	}
-
 	left := modeLabel + panel + envLabel
 
-	// Center: search bar or status message
 	center := ""
 	switch a.state {
 	case StateSearching:
@@ -1021,7 +1007,6 @@ func (a App) renderStatusBar() string {
 		gap = 0
 	}
 	half := gap / 2
-
 	return ui.StatusBarStyle.Width(a.width).Render(
 		left + strings.Repeat(" ", half) + center + strings.Repeat(" ", gap-half) + right,
 	)
@@ -1032,8 +1017,10 @@ func (a App) hintsFor() string {
 		return "Esc·normal "
 	}
 	switch a.focused {
-	case PanelCollections, PanelRequests:
-		return "n·new  d·del  e·rename  /·search  r·run  ?·help  q·quit "
+	case PanelCollections:
+		return "Enter·expand  l·requests  n·new  d·del  e·rename  /·search  q·quit "
+	case PanelRequests:
+		return "n·new  d·del  e·rename  /·search  r·run  ?·help "
 	case PanelEditor:
 		return "i·url  e·body  m·method  t·tab  r·run  ?·help "
 	case PanelResponse:
@@ -1041,6 +1028,8 @@ func (a App) hintsFor() string {
 	}
 	return "?·help  q·quit "
 }
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
 
 func max(a, b int) int {
 	if a > b {

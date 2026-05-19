@@ -74,10 +74,7 @@ func runImport(filePath string) {
 		os.Exit(1)
 	}
 
-	totalRequests := 0
-	for _, c := range fresh {
-		totalRequests += len(c.Requests)
-	}
+	totalRequests := countRequests(fresh)
 
 	fmt.Printf("✓  Imported %d collection(s) · %d request(s)\n", len(fresh), totalRequests)
 	if skipped > 0 {
@@ -85,6 +82,14 @@ func runImport(filePath string) {
 	}
 	fmt.Printf("   Saved to ~/.config/lazyapi/collections.json\n")
 	fmt.Printf("   Run 'lazyapi' to open.\n")
+}
+
+func countRequests(cols []storage.Collection) int {
+	n := 0
+	for _, c := range cols {
+		n += len(c.Requests) + countRequests(c.Children)
+	}
+	return n
 }
 
 func printHelp() {

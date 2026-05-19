@@ -12,53 +12,42 @@ import (
 // ── OpenAPI struct definitions ────────────────────────────────────────────────
 
 type openapiDoc struct {
-	OpenAPI  string                        `json:"openapi"`  // 3.x
-	Swagger  string                        `json:"swagger"`  // 2.x
-	Info     openapiInfo                   `json:"info"`
-	Servers  []openapiServer               `json:"servers"`   // 3.x
-	Host     string                        `json:"host"`      // 2.x
-	BasePath string                        `json:"basePath"`  // 2.x
-	Schemes  []string                      `json:"schemes"`   // 2.x
-	Paths    map[string]openapiPathItem    `json:"paths"`
-	Components openapiComponents           `json:"components"` // 3.x
-	Definitions map[string]openapiSchema   `json:"definitions"` // 2.x
+	OpenAPI    string                     `json:"openapi"`
+	Swagger    string                     `json:"swagger"`
+	Info       openapiInfo                `json:"info"`
+	Servers    []openapiServer            `json:"servers"`
+	Host       string                     `json:"host"`
+	BasePath   string                     `json:"basePath"`
+	Schemes    []string                   `json:"schemes"`
+	Paths      map[string]openapiPathItem `json:"paths"`
+	Components openapiComponents          `json:"components"`
+	Definitions map[string]openapiSchema  `json:"definitions"`
 }
 
-type openapiInfo struct {
-	Title   string `json:"title"`
-	Version string `json:"version"`
-}
+type openapiInfo   struct{ Title, Version string }
+type openapiServer struct{ URL string }
 
-type openapiServer struct {
-	URL string `json:"url"`
-}
-
-// Path item: keys are http methods + optional "parameters", "summary", etc.
 type openapiPathItem map[string]json.RawMessage
 
 type openapiOperation struct {
-	Summary     string              `json:"summary"`
-	OperationID string              `json:"operationId"`
-	Description string              `json:"description"`
-	Tags        []string            `json:"tags"`
-	Parameters  []openapiParameter  `json:"parameters"`
-	RequestBody *openapiRequestBody `json:"requestBody"` // 3.x
-	Consumes    []string            `json:"consumes"`    // 2.x
+	Summary     string             `json:"summary"`
+	OperationID string             `json:"operationId"`
+	Tags        []string           `json:"tags"`
+	Parameters  []openapiParameter `json:"parameters"`
+	RequestBody *openapiReqBody    `json:"requestBody"`
 }
 
 type openapiParameter struct {
-	Name     string        `json:"name"`
-	In       string        `json:"in"`
-	Required bool          `json:"required"`
-	Schema   *openapiSchema `json:"schema"`
-	Type     string        `json:"type"` // 2.x inline
+	Name   string         `json:"name"`
+	In     string         `json:"in"`
+	Schema *openapiSchema `json:"schema"`
 }
 
-type openapiRequestBody struct {
-	Content map[string]openapiMediaType `json:"content"`
+type openapiReqBody struct {
+	Content map[string]openapiMedia `json:"content"`
 }
 
-type openapiMediaType struct {
+type openapiMedia struct {
 	Schema  *openapiSchema  `json:"schema"`
 	Example json.RawMessage `json:"example"`
 }
@@ -71,7 +60,6 @@ type openapiSchema struct {
 	Items      *openapiSchema            `json:"items"`
 	Example    json.RawMessage           `json:"example"`
 	Enum       []interface{}             `json:"enum"`
-	Required   []string                  `json:"required"`
 	AllOf      []*openapiSchema          `json:"allOf"`
 }
 
@@ -79,32 +67,62 @@ type openapiComponents struct {
 	Schemas map[string]*openapiSchema `json:"schemas"`
 }
 
+// ── Path trie ─────────────────────────────────────────────────────────────────
+
+type pathTrie struct {
+	name       string
+	requests   []Request
+	children   map[string]*pathTrie
+	childOrder []string
+}
+
+func newTrie(name string) *pathTrie {
+	return &pathTrie{name: name, children: map[string]*pathTrie{}}
+}
+
+func (t *pathTrie) child(seg string) *pathTrie {
+	if _, ok := t.children[seg]; !ok {
+		t.children[seg] = newTrie(seg)
+		t.childOrder = append(t.childOrder, seg)
+	}
+	return t.children[seg]
+}
+
+func (t *pathTrie) toCollection() Collection {
+	var kids []Collection
+	for _, k := range t.childOrder {
+		kids = append(kids, t.children[k].toCollection())
+	}
+	return Collection{
+		ID:       NewID(),
+		Name:     t.name,
+		Requests: t.requests,
+		Children: kids,
+	}
+}
+
 // ── Public import function ────────────────────────────────────────────────────
 
-// ImportOpenAPI parses an OpenAPI 3.x or Swagger 2.x file and returns collections.
 func ImportOpenAPI(filePath string) ([]Collection, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("read file: %w", err)
 	}
-
 	var doc openapiDoc
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("parse JSON: %w", err)
 	}
-
 	if len(doc.Paths) == 0 {
-		return nil, fmt.Errorf("no paths found in file — is this a valid OpenAPI/Swagger document?")
+		return nil, fmt.Errorf("no paths found — is this a valid OpenAPI/Swagger document?")
 	}
 
 	title := doc.Info.Title
 	if title == "" {
 		title = "Imported API"
 	}
-
 	baseURL := resolveBaseURL(doc)
 
-	// Collect all schemas for $ref resolution
+	// Build schema registry for $ref resolution
 	schemas := map[string]*openapiSchema{}
 	for k, v := range doc.Components.Schemas {
 		s := v
@@ -115,22 +133,16 @@ func ImportOpenAPI(filePath string) ([]Collection, error) {
 		schemas["#/definitions/"+k] = &s
 	}
 
-	// Group requests by first tag
-	tagRequests := map[string][]Request{}
-	var tagOrder []string
-	tagSeen := map[string]bool{}
+	// Root trie named after the API title
+	root := newTrie(title)
 
 	httpMethods := []string{"get", "post", "put", "patch", "delete", "head", "options"}
-
-	// Sort paths for deterministic output
-	sortedPaths := make([]string, 0, len(doc.Paths))
-	for p := range doc.Paths {
-		sortedPaths = append(sortedPaths, p)
-	}
-	sort.Strings(sortedPaths)
+	sortedPaths := sortedKeys(doc.Paths)
 
 	for _, path := range sortedPaths {
 		pathItem := doc.Paths[path]
+		segs := pathSegments(path)
+
 		for _, method := range httpMethods {
 			raw, ok := pathItem[method]
 			if !ok {
@@ -140,57 +152,38 @@ func ImportOpenAPI(filePath string) ([]Collection, error) {
 			if err := json.Unmarshal(raw, &op); err != nil {
 				continue
 			}
-
 			req := buildRequest(method, path, baseURL, op, schemas)
 
-			tag := title // default collection = API title
-			if len(op.Tags) > 0 {
-				tag = op.Tags[0]
+			// Navigate / create trie nodes for each path segment
+			node := root
+			for _, seg := range segs {
+				node = node.child(seg)
 			}
-			if !tagSeen[tag] {
-				tagSeen[tag] = true
-				tagOrder = append(tagOrder, tag)
-			}
-			tagRequests[tag] = append(tagRequests[tag], req)
+			node.requests = append(node.requests, req)
 		}
 	}
 
-	var collections []Collection
-	for _, tag := range tagOrder {
-		colName := tag
-		if tag != title {
-			colName = title + " › " + tag
-		}
-		collections = append(collections, Collection{
+	// Convert root's direct children to top-level collections
+	var cols []Collection
+	for _, k := range root.childOrder {
+		cols = append(cols, root.children[k].toCollection())
+	}
+
+	// If nothing grouped (all requests at "/"), put them under the API title
+	if len(cols) == 0 && len(root.requests) > 0 {
+		cols = []Collection{{
 			ID:       NewID(),
-			Name:     colName,
-			Requests: tagRequests[tag],
-		})
+			Name:     title,
+			Requests: root.requests,
+		}}
 	}
 
-	return collections, nil
+	return cols, nil
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-func resolveBaseURL(doc openapiDoc) string {
-	// OpenAPI 3.x
-	if len(doc.Servers) > 0 {
-		return strings.TrimRight(doc.Servers[0].URL, "/")
-	}
-	// Swagger 2.x
-	if doc.Host != "" {
-		scheme := "https"
-		if len(doc.Schemes) > 0 {
-			scheme = doc.Schemes[0]
-		}
-		return scheme + "://" + doc.Host + doc.BasePath
-	}
-	return ""
-}
+// ── Build helpers ─────────────────────────────────────────────────────────────
 
 func buildRequest(method, path, baseURL string, op openapiOperation, schemas map[string]*openapiSchema) Request {
-	// Name: prefer operationId → summary → METHOD /path
 	name := op.OperationID
 	if name == "" {
 		name = op.Summary
@@ -199,23 +192,21 @@ func buildRequest(method, path, baseURL string, op openapiOperation, schemas map
 		name = strings.ToUpper(method) + " " + path
 	}
 
-	// Build URL, append query params
 	url := baseURL + path
-	var queryParams []string
+	var queryParts []string
 	for _, p := range op.Parameters {
 		if p.In == "query" {
-			queryParams = append(queryParams, p.Name+"=")
+			queryParts = append(queryParts, p.Name+"=")
 		}
 	}
-	if len(queryParams) > 0 {
-		sort.Strings(queryParams)
-		url += "?" + strings.Join(queryParams, "&")
+	if len(queryParts) > 0 {
+		sort.Strings(queryParts)
+		url += "?" + strings.Join(queryParts, "&")
 	}
 
 	headers := map[string]string{}
 	body := ""
 
-	// OpenAPI 3.x requestBody
 	if op.RequestBody != nil {
 		if mt, ok := op.RequestBody.Content["application/json"]; ok {
 			headers["Content-Type"] = "application/json"
@@ -225,7 +216,6 @@ func buildRequest(method, path, baseURL string, op openapiOperation, schemas map
 		} else if _, ok := op.RequestBody.Content["application/x-www-form-urlencoded"]; ok {
 			headers["Content-Type"] = "application/x-www-form-urlencoded"
 		} else {
-			// Take first content type
 			for ct, mt := range op.RequestBody.Content {
 				headers["Content-Type"] = ct
 				body = extractBody(mt, schemas)
@@ -233,13 +223,12 @@ func buildRequest(method, path, baseURL string, op openapiOperation, schemas map
 			}
 		}
 	}
-
-	// Swagger 2.x: body parameter
+	// Swagger 2.x body parameter
 	for _, p := range op.Parameters {
 		if p.In == "body" && p.Schema != nil {
 			headers["Content-Type"] = "application/json"
-			example := generateExample(resolveRef(p.Schema, schemas), schemas, 0)
-			if b, err := prettyJSON(example); err == nil {
+			ex := generateExample(resolveRef(p.Schema, schemas), schemas, 0)
+			if b, err := prettyJSON(ex); err == nil {
 				body = b
 			}
 			break
@@ -256,37 +245,33 @@ func buildRequest(method, path, baseURL string, op openapiOperation, schemas map
 	}
 }
 
-func extractBody(mt openapiMediaType, schemas map[string]*openapiSchema) string {
-	// Prefer explicit example
+func extractBody(mt openapiMedia, schemas map[string]*openapiSchema) string {
 	if mt.Example != nil && string(mt.Example) != "null" {
 		if b, err := prettyJSONRaw(mt.Example); err == nil {
 			return b
 		}
 	}
-	// Generate from schema
 	if mt.Schema != nil {
-		example := generateExample(resolveRef(mt.Schema, schemas), schemas, 0)
-		if b, err := prettyJSON(example); err == nil {
+		ex := generateExample(resolveRef(mt.Schema, schemas), schemas, 0)
+		if b, err := prettyJSON(ex); err == nil {
 			return b
 		}
 	}
 	return ""
 }
 
-// resolveRef follows a $ref pointer if present.
 func resolveRef(s *openapiSchema, schemas map[string]*openapiSchema) *openapiSchema {
 	if s == nil {
 		return nil
 	}
 	if s.Ref != "" {
-		if resolved, ok := schemas[s.Ref]; ok {
-			return resolved
+		if r, ok := schemas[s.Ref]; ok {
+			return r
 		}
 	}
 	return s
 }
 
-// generateExample produces a sample value from a schema (max depth 5).
 func generateExample(s *openapiSchema, schemas map[string]*openapiSchema, depth int) interface{} {
 	if s == nil || depth > 5 {
 		return nil
@@ -295,27 +280,19 @@ func generateExample(s *openapiSchema, schemas map[string]*openapiSchema, depth 
 	if s == nil {
 		return nil
 	}
-
-	// Explicit example wins
 	if s.Example != nil && string(s.Example) != "null" {
 		var v interface{}
 		if json.Unmarshal(s.Example, &v) == nil {
 			return v
 		}
 	}
-	// Enum: pick first
 	if len(s.Enum) > 0 {
 		return s.Enum[0]
 	}
-	// allOf: merge all schemas
 	if len(s.AllOf) > 0 {
 		merged := map[string]interface{}{}
 		for _, sub := range s.AllOf {
-			sub = resolveRef(sub, schemas)
-			if sub == nil {
-				continue
-			}
-			if v, ok := generateExample(sub, schemas, depth+1).(map[string]interface{}); ok {
+			if v, ok := generateExample(resolveRef(sub, schemas), schemas, depth+1).(map[string]interface{}); ok {
 				for k, val := range v {
 					merged[k] = val
 				}
@@ -325,20 +302,13 @@ func generateExample(s *openapiSchema, schemas map[string]*openapiSchema, depth 
 			return merged
 		}
 	}
-
 	switch s.Type {
 	case "object", "":
 		if len(s.Properties) == 0 {
 			return map[string]interface{}{}
 		}
 		obj := map[string]interface{}{}
-		// Sort property keys for determinism
-		keys := make([]string, 0, len(s.Properties))
-		for k := range s.Properties {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
+		for _, k := range sortedKeys(s.Properties) {
 			obj[k] = generateExample(s.Properties[k], schemas, depth+1)
 		}
 		return obj
@@ -359,8 +329,6 @@ func generateExample(s *openapiSchema, schemas map[string]*openapiSchema, depth 
 			return "00000000-0000-0000-0000-000000000000"
 		case "uri", "url":
 			return "https://example.com"
-		case "binary", "byte":
-			return ""
 		default:
 			return "string"
 		}
@@ -370,10 +338,43 @@ func generateExample(s *openapiSchema, schemas map[string]*openapiSchema, depth 
 		return 0.0
 	case "boolean":
 		return true
-	case "null":
-		return nil
 	}
 	return nil
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
+func resolveBaseURL(doc openapiDoc) string {
+	if len(doc.Servers) > 0 {
+		return strings.TrimRight(doc.Servers[0].URL, "/")
+	}
+	if doc.Host != "" {
+		scheme := "https"
+		if len(doc.Schemes) > 0 {
+			scheme = doc.Schemes[0]
+		}
+		return scheme + "://" + doc.Host + doc.BasePath
+	}
+	return ""
+}
+
+func pathSegments(path string) []string {
+	var segs []string
+	for _, s := range strings.Split(strings.Trim(path, "/"), "/") {
+		if s != "" {
+			segs = append(segs, s)
+		}
+	}
+	return segs
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func prettyJSON(v interface{}) (string, error) {

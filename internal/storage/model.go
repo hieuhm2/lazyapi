@@ -1,9 +1,10 @@
 package storage
 
 type Collection struct {
-	ID       string    `json:"id"`
-	Name     string    `json:"name"`
-	Requests []Request `json:"requests"`
+	ID       string       `json:"id"`
+	Name     string       `json:"name"`
+	Requests []Request    `json:"requests"`
+	Children []Collection `json:"children,omitempty"`
 }
 
 type Request struct {
