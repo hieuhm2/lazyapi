@@ -56,4 +56,7 @@ const (
 	StateRename
 	StateDeleteConfirm
 	StateSearching
+	StateNewHeaderKey   // step 1: enter header name
+	StateNewHeaderValue // step 2: enter header value
+	StateEditHeaderValue
 )

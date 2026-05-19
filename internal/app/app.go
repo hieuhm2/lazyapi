@@ -58,6 +58,9 @@ type App struct {
 	// Search
 	searchInput textinput.Model
 
+	// Header editing (two-step input)
+	pendingHeaderKey string
+
 	// Persistence
 	store *storage.Store
 
@@ -165,7 +168,8 @@ func (a App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case StateHelp:
 		a.state = StateDefault
 		return a, nil
-	case StateNewCollection, StateNewRequest, StateRename:
+	case StateNewCollection, StateNewRequest, StateRename,
+		StateNewHeaderKey, StateNewHeaderValue, StateEditHeaderValue:
 		return a.handleOverlay(msg)
 	case StateDeleteConfirm:
 		return a.handleDeleteConfirm(msg)
@@ -217,15 +221,24 @@ func (a App) handleNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	// Actions
+	// Actions (with per-tab overrides for the editor panel)
 	switch k {
 	case "r", "enter":
 		return a.executeRequest()
 	case "n":
+		if a.focused == PanelEditor && a.editor.ActiveTab == ui.EditorTabHeaders {
+			return a.startNewHeader()
+		}
 		return a.startNew()
 	case "d":
+		if a.focused == PanelEditor && a.editor.ActiveTab == ui.EditorTabHeaders {
+			return a.deleteSelectedHeader()
+		}
 		return a.startDelete()
 	case "e":
+		if a.focused == PanelEditor && a.editor.ActiveTab == ui.EditorTabHeaders {
+			return a.startEditHeader()
+		}
 		if a.focused == PanelEditor && a.editor.ActiveTab == ui.EditorTabBody {
 			return a.openExternalEditor()
 		}
@@ -276,9 +289,17 @@ func (a App) handleNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Navigation
 	switch k {
 	case "j", "down":
-		a.moveDown()
+		if a.focused == PanelEditor && a.editor.ActiveTab == ui.EditorTabHeaders {
+			a.editor.MoveHeaderDown()
+		} else {
+			a.moveDown()
+		}
 	case "k", "up":
-		a.moveUp()
+		if a.focused == PanelEditor && a.editor.ActiveTab == ui.EditorTabHeaders {
+			a.editor.MoveHeaderUp()
+		} else {
+			a.moveUp()
+		}
 	case "G":
 		a.goBottom()
 		a.ggPressed = false
@@ -343,40 +364,51 @@ func (a App) handleInsert(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return a, cmd
 }
 
-// ── Overlay (new/rename) ─────────────────────────────────────────────────────
+// ── Overlay (new/rename/header editing) ─────────────────────────────────────
 
 func (a App) handleOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
+	if msg.String() == "esc" {
 		a.state = StateDefault
 		a.overlayInput.Blur()
+		a.pendingHeaderKey = ""
 		return a, nil
-	case "enter":
+	}
+
+	if msg.String() != "enter" {
+		var cmd tea.Cmd
+		a.overlayInput, cmd = a.overlayInput.Update(msg)
+		return a, cmd
+	}
+
+	// Enter pressed — dispatch per state
+	switch a.state {
+	case StateNewCollection:
 		val := strings.TrimSpace(a.overlayInput.Value())
-		if val == "" {
-			a.state = StateDefault
-			return a, nil
-		}
-		switch a.state {
-		case StateNewCollection:
-			a.collections = append(a.collections, storage.Collection{
-				ID:   storage.NewID(),
-				Name: val,
-			})
+		if val != "" {
+			a.collections = append(a.collections, storage.Collection{ID: storage.NewID(), Name: val})
 			a.colIdx = len(a.collections) - 1
 			a.reqIdx = 0
-		case StateNewRequest:
-			if a.colIdx < len(a.collections) {
-				newReq := storage.Request{
-					ID:     storage.NewID(),
-					Name:   val,
-					Method: "GET",
-					URL:    "",
-				}
-				a.collections[a.colIdx].Requests = append(a.collections[a.colIdx].Requests, newReq)
-				a.reqIdx = len(a.collections[a.colIdx].Requests) - 1
-			}
-		case StateRename:
+		}
+		a.state = StateDefault
+		a.overlayInput.Blur()
+		a.syncPanels()
+		return a, a.save()
+
+	case StateNewRequest:
+		val := strings.TrimSpace(a.overlayInput.Value())
+		if val != "" && a.colIdx < len(a.collections) {
+			newReq := storage.Request{ID: storage.NewID(), Name: val, Method: "GET"}
+			a.collections[a.colIdx].Requests = append(a.collections[a.colIdx].Requests, newReq)
+			a.reqIdx = len(a.collections[a.colIdx].Requests) - 1
+		}
+		a.state = StateDefault
+		a.overlayInput.Blur()
+		a.syncPanels()
+		return a, a.save()
+
+	case StateRename:
+		val := strings.TrimSpace(a.overlayInput.Value())
+		if val != "" {
 			switch a.focused {
 			case PanelCollections:
 				if a.colIdx < len(a.collections) {
@@ -395,11 +427,53 @@ func (a App) handleOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.overlayInput.Blur()
 		a.syncPanels()
 		return a, a.save()
+
+	case StateNewHeaderKey:
+		key := strings.TrimSpace(a.overlayInput.Value())
+		if key == "" {
+			a.state = StateDefault
+			a.overlayInput.Blur()
+			return a, nil
+		}
+		// Step 2: ask for the value
+		a.pendingHeaderKey = key
+		a.state = StateNewHeaderValue
+		a.overlayTitle = fmt.Sprintf("Value for '%s'", key)
+		a.overlayInput.Placeholder = "header value"
+		a.overlayInput.SetValue("")
+		return a, nil // stay in overlay
+
+	case StateNewHeaderValue:
+		if a.colIdx < len(a.collections) {
+			reqs := a.collections[a.colIdx].Requests
+			if a.reqIdx < len(reqs) {
+				if a.collections[a.colIdx].Requests[a.reqIdx].Headers == nil {
+					a.collections[a.colIdx].Requests[a.reqIdx].Headers = make(map[string]string)
+				}
+				a.collections[a.colIdx].Requests[a.reqIdx].Headers[a.pendingHeaderKey] = a.overlayInput.Value()
+				a.editor.SetRequest(&a.collections[a.colIdx].Requests[a.reqIdx])
+			}
+		}
+		a.pendingHeaderKey = ""
+		a.state = StateDefault
+		a.overlayInput.Blur()
+		return a, a.save()
+
+	case StateEditHeaderValue:
+		hKey := a.editor.SelectedHeaderKey()
+		if hKey != "" && a.colIdx < len(a.collections) {
+			reqs := a.collections[a.colIdx].Requests
+			if a.reqIdx < len(reqs) {
+				a.collections[a.colIdx].Requests[a.reqIdx].Headers[hKey] = a.overlayInput.Value()
+				a.editor.SetRequest(&a.collections[a.colIdx].Requests[a.reqIdx])
+			}
+		}
+		a.state = StateDefault
+		a.overlayInput.Blur()
+		return a, a.save()
 	}
 
-	var cmd tea.Cmd
-	a.overlayInput, cmd = a.overlayInput.Update(msg)
-	return a, cmd
+	return a, nil
 }
 
 // ── Delete confirm ────────────────────────────────────────────────────────────
@@ -644,6 +718,53 @@ func (a App) startRename() (tea.Model, tea.Cmd) {
 	a.overlayTitle = "Rename"
 	a.overlayInput.Placeholder = "new name"
 	a.overlayInput.SetValue(current)
+	a.overlayInput.Focus()
+	return a, nil
+}
+
+func (a App) startNewHeader() (tea.Model, tea.Cmd) {
+	a.state = StateNewHeaderKey
+	a.overlayTitle = "Header Key"
+	a.overlayInput.Placeholder = "e.g. Authorization"
+	a.overlayInput.SetValue("")
+	a.overlayInput.Focus()
+	return a, nil
+}
+
+func (a App) deleteSelectedHeader() (tea.Model, tea.Cmd) {
+	key := a.editor.SelectedHeaderKey()
+	if key == "" {
+		return a, nil
+	}
+	if a.colIdx < len(a.collections) {
+		reqs := a.collections[a.colIdx].Requests
+		if a.reqIdx < len(reqs) {
+			delete(a.collections[a.colIdx].Requests[a.reqIdx].Headers, key)
+			a.editor.SetRequest(&a.collections[a.colIdx].Requests[a.reqIdx])
+			if a.editor.HeaderCursor > 0 {
+				a.editor.HeaderCursor--
+			}
+		}
+	}
+	return a, a.save()
+}
+
+func (a App) startEditHeader() (tea.Model, tea.Cmd) {
+	key := a.editor.SelectedHeaderKey()
+	if key == "" {
+		return a, nil
+	}
+	currentVal := ""
+	if a.colIdx < len(a.collections) {
+		reqs := a.collections[a.colIdx].Requests
+		if a.reqIdx < len(reqs) {
+			currentVal = reqs[a.reqIdx].Headers[key]
+		}
+	}
+	a.state = StateEditHeaderValue
+	a.overlayTitle = fmt.Sprintf("Edit '%s'", key)
+	a.overlayInput.Placeholder = "value"
+	a.overlayInput.SetValue(currentVal)
 	a.overlayInput.Focus()
 	return a, nil
 }
