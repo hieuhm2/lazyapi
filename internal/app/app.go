@@ -914,11 +914,26 @@ func (a App) View() string {
 	if a.width == 0 {
 		return "Loading..."
 	}
-
 	if a.state == StateHelp {
 		return ui.RenderHelp(a.width, a.height)
 	}
 
+	main := a.renderMain()
+
+	switch a.state {
+	case StateNewCollection, StateNewRequest, StateRename,
+		StateNewHeaderKey, StateNewHeaderValue, StateEditHeaderValue:
+		popup := ui.InputPopup(a.overlayTitle, "Enter · confirm     Esc · cancel", a.overlayInput)
+		return ui.PlaceOverlay(main, popup, a.width, a.height)
+	case StateDeleteConfirm:
+		popup := ui.ConfirmPopup(a.deleteTarget)
+		return ui.PlaceOverlay(main, popup, a.width, a.height)
+	}
+
+	return main
+}
+
+func (a App) renderMain() string {
 	// Dimensions
 	statusH := 1
 	topH := (a.height - statusH) * 57 / 100
@@ -935,7 +950,6 @@ func (a App) View() string {
 	reqW := a.width * 22 / 100
 	editorW := a.width - colW - reqW
 
-	// Set panel sizes
 	a.colPanel.Width = colW
 	a.colPanel.Height = topH
 	a.reqPanel.Width = reqW
@@ -945,7 +959,6 @@ func (a App) View() string {
 	a.response.Width = a.width
 	a.response.Height = botH
 
-	// Render panels
 	var reqs []storage.Request
 	if a.colIdx < len(a.collections) {
 		reqs = a.collections[a.colIdx].Requests
@@ -957,9 +970,7 @@ func (a App) View() string {
 		a.editor.View(),
 	)
 	botRow := a.response.View()
-
-	statusBar := a.renderStatusBar()
-	return lipgloss.JoinVertical(lipgloss.Left, topRow, botRow, statusBar)
+	return lipgloss.JoinVertical(lipgloss.Left, topRow, botRow, a.renderStatusBar())
 }
 
 func (a App) renderStatusBar() string {
@@ -989,21 +1000,13 @@ func (a App) renderStatusBar() string {
 
 	left := modeLabel + panel + envLabel
 
-	// Center: status message or state hint
+	// Center: search bar or status message
 	center := ""
 	switch a.state {
-	case StateNewCollection, StateNewRequest, StateRename,
-		StateNewHeaderKey, StateNewHeaderValue, StateEditHeaderValue:
-		center = lipgloss.NewStyle().Foreground(ui.ColorBorderFocused).Render("  "+a.overlayTitle+": ") +
-			a.overlayInput.View() +
-			ui.MutedStyle.Render("  <Enter> confirm  <Esc> cancel")
-	case StateDeleteConfirm:
-		center = lipgloss.NewStyle().Foreground(ui.ColorError).Bold(true).Render(
-			fmt.Sprintf("  Delete '%s'? [y/n]", a.deleteTarget))
 	case StateSearching:
 		center = lipgloss.NewStyle().Foreground(ui.ColorBorderFocused).Render("  /") +
 			a.searchInput.View() +
-			ui.MutedStyle.Render("  <Enter> confirm  <Esc> clear")
+			ui.MutedStyle.Render("  Enter · confirm   Esc · clear")
 	default:
 		if a.statusMsg != "" {
 			center = lipgloss.NewStyle().Foreground(ui.ColorWarning).Render("  " + a.statusMsg)
