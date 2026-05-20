@@ -10,17 +10,16 @@ import (
 
 // ── Tree node ─────────────────────────────────────────────────────────────────
 
-// TreeNode is a flattened entry in the visible tree (one per rendered row).
 type TreeNode struct {
-	Path     []int  // path of indices to reach this collection
-	Depth    int
-	ID       string
-	Name     string
-	HasKids  bool
-	ReqCount int
+	Path       []int
+	Depth      int
+	ID         string
+	Name       string
+	Breadcrumb string // full ancestor path, set during fuzzy search
+	HasKids    bool
+	ReqCount   int
 }
 
-// BuildTree returns the flat list of nodes currently visible (respecting expanded).
 func BuildTree(cols []storage.Collection, expanded map[string]bool, depth int, prefix []int) []TreeNode {
 	var nodes []TreeNode
 	for i, col := range cols {
@@ -44,7 +43,6 @@ func BuildTree(cols []storage.Collection, expanded map[string]bool, depth int, p
 	return nodes
 }
 
-// PathEqual compares two paths.
 func PathEqual(a, b []int) bool {
 	if len(a) != len(b) {
 		return false
@@ -60,12 +58,15 @@ func PathEqual(a, b []int) bool {
 // ── Panel ─────────────────────────────────────────────────────────────────────
 
 type CollectionsPanel struct {
-	Cursor   int              // index into the visible flat tree
-	Expanded map[string]bool  // collection ID → expanded
-	Filter   string
-	Focused  bool
-	Width    int
-	Height   int
+	Cursor       int
+	ScrollOffset int
+	Expanded     map[string]bool
+	Filter       string
+	SearchActive bool   // render search bar inside panel
+	SearchView   string // pre-rendered search input string (with cursor)
+	Focused      bool
+	Width        int
+	Height       int
 }
 
 func NewCollectionsPanel() CollectionsPanel {
@@ -73,47 +74,92 @@ func NewCollectionsPanel() CollectionsPanel {
 }
 
 func (p CollectionsPanel) visible(cols []storage.Collection) []TreeNode {
-	all := BuildTree(cols, p.Expanded, 0, nil)
 	if p.Filter == "" {
-		return all
+		return BuildTree(cols, p.Expanded, 0, nil)
 	}
-	f := strings.ToLower(p.Filter)
-	var out []TreeNode
-	for _, n := range all {
-		if strings.Contains(strings.ToLower(n.Name), f) {
-			out = append(out, n)
-		}
-	}
-	return out
+	return FuzzySearchCollections(cols, p.Filter)
 }
 
 func (p *CollectionsPanel) SetFilter(f string) {
 	p.Filter = f
 	p.Cursor = 0
+	p.ScrollOffset = 0
+}
+
+// ExpandPath expands all ancestor collections so the node at path becomes
+// visible in the normal (non-filtered) tree, then positions the cursor on it.
+func (p *CollectionsPanel) ExpandPath(cols []storage.Collection, path []int) {
+	if p.Expanded == nil {
+		p.Expanded = map[string]bool{}
+	}
+	cur := cols
+	for depth := 0; depth < len(path)-1; depth++ {
+		idx := path[depth]
+		if idx >= len(cur) {
+			break
+		}
+		p.Expanded[cur[idx].ID] = true
+		cur = cur[idx].Children
+	}
+	p.Cursor = p.CursorForPath(cols, path)
+	p.clampScroll()
+}
+
+// listRows returns the number of rows available for list items.
+func (p *CollectionsPanel) listRows() int {
+	if p.Height == 0 {
+		return 10
+	}
+	r := p.Height - 4 // border(2) + title(1) + margin
+	if p.SearchActive {
+		r -= 2 // separator + input line
+	}
+	if r < 1 {
+		r = 1
+	}
+	return r
+}
+
+func (p *CollectionsPanel) clampScroll() {
+	rows := p.listRows()
+	if p.Cursor < p.ScrollOffset {
+		p.ScrollOffset = p.Cursor
+	}
+	if p.Cursor >= p.ScrollOffset+rows {
+		p.ScrollOffset = p.Cursor - rows + 1
+	}
+	if p.ScrollOffset < 0 {
+		p.ScrollOffset = 0
+	}
 }
 
 func (p *CollectionsPanel) MoveUp() {
 	if p.Cursor > 0 {
 		p.Cursor--
 	}
+	p.clampScroll()
 }
 
 func (p *CollectionsPanel) MoveDown(cols []storage.Collection) {
 	if p.Cursor < len(p.visible(cols))-1 {
 		p.Cursor++
 	}
+	p.clampScroll()
 }
 
-func (p *CollectionsPanel) GoTop() { p.Cursor = 0 }
+func (p *CollectionsPanel) GoTop() {
+	p.Cursor = 0
+	p.ScrollOffset = 0
+}
 
 func (p *CollectionsPanel) GoBottom(cols []storage.Collection) {
 	n := len(p.visible(cols))
 	if n > 0 {
 		p.Cursor = n - 1
 	}
+	p.clampScroll()
 }
 
-// Toggle expands or collapses the node under the cursor.
 func (p *CollectionsPanel) Toggle(cols []storage.Collection) {
 	nodes := p.visible(cols)
 	if p.Cursor >= len(nodes) {
@@ -131,9 +177,9 @@ func (p *CollectionsPanel) Toggle(cols []storage.Collection) {
 	} else {
 		p.Expanded[n.ID] = true
 	}
+	p.clampScroll()
 }
 
-// CollapseToParent collapses the node if expanded, or moves cursor to parent.
 func (p *CollectionsPanel) CollapseToParent(cols []storage.Collection) {
 	nodes := p.visible(cols)
 	if p.Cursor >= len(nodes) {
@@ -142,18 +188,18 @@ func (p *CollectionsPanel) CollapseToParent(cols []storage.Collection) {
 	n := nodes[p.Cursor]
 	if n.HasKids && p.Expanded[n.ID] {
 		delete(p.Expanded, n.ID)
+		p.clampScroll()
 		return
 	}
-	// Find parent: last node with depth = n.Depth-1, at cursor position < current
 	for i := p.Cursor - 1; i >= 0; i-- {
 		if nodes[i].Depth == n.Depth-1 {
 			p.Cursor = i
+			p.clampScroll()
 			return
 		}
 	}
 }
 
-// SelectedPath returns the []int path of the currently selected node.
 func (p CollectionsPanel) SelectedPath(cols []storage.Collection) []int {
 	nodes := p.visible(cols)
 	if p.Cursor >= len(nodes) {
@@ -162,7 +208,6 @@ func (p CollectionsPanel) SelectedPath(cols []storage.Collection) []int {
 	return nodes[p.Cursor].Path
 }
 
-// SelectedHasKids returns true if the selected node has children.
 func (p CollectionsPanel) SelectedHasKids(cols []storage.Collection) bool {
 	nodes := p.visible(cols)
 	if p.Cursor >= len(nodes) {
@@ -171,7 +216,6 @@ func (p CollectionsPanel) SelectedHasKids(cols []storage.Collection) bool {
 	return nodes[p.Cursor].HasKids
 }
 
-// CursorForPath returns the cursor index for a given path (or 0 if not found).
 func (p CollectionsPanel) CursorForPath(cols []storage.Collection, path []int) int {
 	nodes := p.visible(cols)
 	for i, n := range nodes {
@@ -191,47 +235,74 @@ func (p CollectionsPanel) View(cols []storage.Collection) string {
 	}
 
 	title := titleSt.Render("Collections")
-	if p.Filter != "" {
-		title = titleSt.Render(fmt.Sprintf("Collections /%s", p.Filter))
-	}
-
 	nodes := p.visible(cols)
 	itemW := p.Width - 6
+	rows := p.listRows()
 
 	var sb strings.Builder
 	sb.WriteString(title + "\n")
 
 	if len(nodes) == 0 {
-		sb.WriteString(MutedStyle.Padding(0, 1).Render("No collections") + "\n")
+		if p.Filter != "" {
+			sb.WriteString(MutedStyle.Padding(0, 1).Render("No matches") + "\n")
+		} else {
+			sb.WriteString(MutedStyle.Padding(0, 1).Render("No collections") + "\n")
+		}
 	}
 
-	for i, n := range nodes {
-		indent := strings.Repeat("  ", n.Depth)
+	// Render only the visible window
+	searching := p.Filter != ""
+	end := p.ScrollOffset + rows
+	if end > len(nodes) {
+		end = len(nodes)
+	}
+	for i := p.ScrollOffset; i < end; i++ {
+		n := nodes[i]
 
-		// Expand icon
-		icon := "·"
-		if n.HasKids {
-			if p.Expanded[n.ID] {
-				icon = "▼"
-			} else {
-				icon = "▶"
+		var label, selectedLabel string
+		if searching {
+			// Flat fuzzy results: show full breadcrumb, no tree chrome
+			reqBadge := ""
+			if n.ReqCount > 0 {
+				reqBadge = MutedStyle.Render(fmt.Sprintf(" (%d)", n.ReqCount))
 			}
+			label = n.Breadcrumb + reqBadge
+			selectedLabel = n.Breadcrumb
+		} else {
+			indent := strings.Repeat("  ", n.Depth)
+			icon := "·"
+			if n.HasKids {
+				if p.Expanded[n.ID] {
+					icon = "▼"
+				} else {
+					icon = "▶"
+				}
+			}
+			iconStr := lipgloss.NewStyle().Foreground(ColorMuted).Render(icon)
+			reqBadge := ""
+			if n.ReqCount > 0 {
+				reqBadge = MutedStyle.Render(fmt.Sprintf(" (%d)", n.ReqCount))
+			}
+			label = indent + iconStr + " " + n.Name + reqBadge
+			selectedLabel = indent + icon + " " + n.Name
 		}
-		iconStr := lipgloss.NewStyle().Foreground(ColorMuted).Render(icon)
-
-		reqBadge := ""
-		if n.ReqCount > 0 {
-			reqBadge = MutedStyle.Render(fmt.Sprintf(" (%d)", n.ReqCount))
-		}
-		label := indent + iconStr + " " + n.Name + reqBadge
 
 		if i == p.Cursor && p.Focused {
-			sb.WriteString(SelectedItemStyle.Width(itemW).Render(indent+icon+" "+n.Name) + "\n")
+			sb.WriteString(SelectedItemStyle.Width(itemW).Render(selectedLabel) + "\n")
 		} else if i == p.Cursor {
 			sb.WriteString(lipgloss.NewStyle().Foreground(ColorSelectedText).Width(itemW).Padding(0, 1).Render(label) + "\n")
 		} else {
 			sb.WriteString(NormalItemStyle.Width(itemW).Render(label) + "\n")
 		}
+	}
+
+	// In-panel search bar
+	if p.SearchActive {
+		sb.WriteString("\n")
+		sep := lipgloss.NewStyle().Foreground(ColorBorder).Render(strings.Repeat("─", p.Width-6))
+		prefix := lipgloss.NewStyle().Foreground(ColorBorderFocused).Bold(true).Render("/")
+		sb.WriteString(sep + "\n")
+		sb.WriteString(prefix + " " + p.SearchView + "\n")
 	}
 
 	return style.Width(p.Width - 2).Height(p.Height - 2).Render(sb.String())

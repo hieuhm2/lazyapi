@@ -512,32 +512,64 @@ func (a App) handleDeleteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (a App) handleSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "esc", "enter":
+	case "esc":
 		a.state = StateDefault
-		filter := a.searchInput.Value()
 		a.searchInput.Blur()
-		if msg.String() == "esc" {
-			filter = ""
-		}
+		a.searchInput.SetValue("")
 		if a.focused == PanelCollections {
-			a.colPanel.SetFilter(filter)
+			a.colPanel.SetFilter("")
 		} else {
-			a.reqPanel.SetFilter(filter)
-			if msg.String() == "enter" {
-				col := a.currentCollection()
+			a.reqPanel.SetFilter("") // also clears GlobalSearchResults
+		}
+		a.syncEditor()
+		return a, nil
+
+	case "enter":
+		a.state = StateDefault
+		a.searchInput.Blur()
+		a.searchInput.SetValue("")
+
+		if a.focused == PanelCollections {
+			// Navigate to the selected collection: expand its ancestors so it's
+			// visible in the normal tree, then clear the filter.
+			selectedPath := a.colPanel.SelectedPath(a.collections)
+			a.colPanel.SetFilter("")
+			if len(selectedPath) > 0 {
+				a.colPanel.ExpandPath(a.collections, selectedPath)
+			}
+			a.reqIdx = 0
+			a.reqPanel.Cursor = 0
+		} else if a.focused == PanelRequests {
+			if gr := a.reqPanel.SelectedGlobal(); gr != nil {
+				// Navigate to the collection that owns this request.
+				a.colPanel.ExpandPath(a.collections, gr.ColPath)
+				col := getCollByPath(a.collections, gr.ColPath)
 				if col != nil {
-					idx := a.reqPanel.SelectedIdx(col.Requests)
-					if idx >= 0 {
-						a.reqIdx = idx
+					for i, r := range col.Requests {
+						if r.ID == gr.Req.ID {
+							a.reqIdx = i
+							break
+						}
 					}
 				}
+				a.reqPanel.Cursor = 0
 			}
+			a.reqPanel.SetFilter("")
 		}
 		a.syncEditor()
 		return a, nil
 	}
+
+	// Live filter: update as the user types
 	var cmd tea.Cmd
 	a.searchInput, cmd = a.searchInput.Update(msg)
+	query := a.searchInput.Value()
+	if a.focused == PanelCollections {
+		a.colPanel.SetFilter(query)
+	} else {
+		a.reqPanel.SetFilter(query)
+		a.reqPanel.GlobalSearchResults = ui.FuzzySearchRequests(a.collections, query)
+	}
 	return a, cmd
 }
 
@@ -951,6 +983,18 @@ func (a App) renderMain() string {
 	a.response.Width = a.width
 	a.response.Height = botH
 
+	// Inject search state into whichever panel is searching
+	a.colPanel.SearchActive = a.state == StateSearching && a.focused == PanelCollections
+	a.colPanel.SearchView = ""
+	a.reqPanel.SearchActive = a.state == StateSearching && a.focused == PanelRequests
+	a.reqPanel.SearchView = ""
+	if a.colPanel.SearchActive {
+		a.colPanel.SearchView = a.searchInput.View()
+	}
+	if a.reqPanel.SearchActive {
+		a.reqPanel.SearchView = a.searchInput.View()
+	}
+
 	var reqs []storage.Request
 	if col := a.currentCollection(); col != nil {
 		reqs = col.Requests
@@ -988,15 +1032,8 @@ func (a App) renderStatusBar() string {
 	left := modeLabel + panel + envLabel
 
 	center := ""
-	switch a.state {
-	case StateSearching:
-		center = lipgloss.NewStyle().Foreground(ui.ColorBorderFocused).Render("  /") +
-			a.searchInput.View() +
-			ui.MutedStyle.Render("  Enter · confirm   Esc · clear")
-	default:
-		if a.statusMsg != "" {
-			center = lipgloss.NewStyle().Foreground(ui.ColorWarning).Render("  " + a.statusMsg)
-		}
+	if a.statusMsg != "" {
+		center = lipgloss.NewStyle().Foreground(ui.ColorWarning).Render("  " + a.statusMsg)
 	}
 
 	right := ui.MutedStyle.Render(a.hintsFor())
@@ -1013,6 +1050,9 @@ func (a App) renderStatusBar() string {
 }
 
 func (a App) hintsFor() string {
+	if a.state == StateSearching {
+		return "Enter·confirm   Esc·clear "
+	}
 	if a.mode == ModeInsert {
 		return "Esc·normal "
 	}
